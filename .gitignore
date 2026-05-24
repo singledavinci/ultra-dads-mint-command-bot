@@ -1,0 +1,57 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+standalone/
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Secrets and runtime state — never commit
+.env
+.env.*
+!.env.example
+.env.local
+.env.*.local
+
+# Persistent runtime state contains mnemonics, private keys and RPC URLs
+data/
+data/state.json
+
+# SSH / signing keys — never commit
+*_key
+*_key.pub
+*.pem
+id_rsa*
+id_ed25519*
+
+# Lint / error dumps — historically inlined source snippets containing tokens
+errors.txt
+eslint_output.json
+lint_*.json
+lint_*.txt
+parsed_lint.txt
+
+# Legacy test files with hardcoded secrets
+test-telegram.mjs
+test-tracker.js
+test-automint.ts
+registerCommands.js
+registerCommands.mjs

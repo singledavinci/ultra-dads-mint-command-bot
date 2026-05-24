@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ultra Dads // Minter Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="controls.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="dashboard">
+        <header class="top-bar">
+            <div class="logo">
+                <div class="logo-icon"></div>
+                <span class="logo-text">Ultra Dads v2.4</span>
+            </div>
+            <div class="header-right">
+                <div class="status-badge" id="system-badge">
+                    <div class="dot"></div>
+                    <span id="system-status">Connecting...</span>
+                </div>
+                <span class="last-update" id="last-update"></span>
+            </div>
+        </header>
+
+        <!-- Stats Row -->
+        <section class="stats-row">
+            <div class="stat-card">
+                <div class="stat-label">Tracker</div>
+                <div class="stat-value" id="stat-tracker">—</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Auto-Mint</div>
+                <div class="stat-value" id="stat-automint">—</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Wallets</div>
+                <div class="stat-value" id="stat-wallets">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">ETH Spent</div>
+                <div class="stat-value" id="stat-eth">0.0000</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Net Profit</div>
+                <div class="stat-value profit" id="stat-profit">0.0000</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">RPC Latency</div>
+                <div class="stat-value" id="stat-rpc">—</div>
+            </div>
+        </section>
+
+        <!-- Main Grid -->
+        <section class="main-grid">
+            <!-- Left: Live Feed -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🐋 Live Whale Activity</span>
+                    <span class="badge" id="tracked-count">0 targets</span>
+                </div>
+                <div class="feed-container" id="mint-feed">
+                    <div class="empty-state">🔭 Monitoring blockchain...</div>
+                </div>
+            </div>
+
+            <!-- Right Column -->
+            <div class="right-col">
+                <!-- Engine Config -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">⚙️ Engine</span>
+                    </div>
+                    <div class="config-list">
+                        <div class="config-item">
+                            <span class="config-label">Auto-Mint</span>
+                            <span class="config-value toggle" id="conf-automint" data-key="autoMint">—</span>
+                        </div>
+                        <div class="config-item">
+                            <span class="config-label">MEV Shield</span>
+                            <span class="config-value toggle" id="conf-mev" data-key="mevProtection">—</span>
+                        </div>
+                        <div class="config-item">
+                            <span class="config-label">Simulation</span>
+                            <span class="config-value toggle" id="conf-sim" data-key="skipSimulation">—</span>
+                        </div>
+                        <div class="config-item">
+                            <span class="config-label">Gas Bribe</span>
+                            <span class="config-value editable" id="conf-bribe" data-key="gasBribeGwei">—</span>
+                        </div>
+                        <div class="config-item">
+                            <span class="config-label">Max Mint</span>
+                            <span class="config-value editable" id="conf-maxmint" data-key="maxMintLimit">—</span>
+                        </div>
+                        <div class="config-item">
+                            <span class="config-label">RPC Node</span>
+                            <span class="config-value" id="conf-rpc">—</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Execution Log -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">📋 Executions</span>
+                        <span class="badge" id="exec-ratio">0/0</span>
+                    </div>
+                    <div class="exec-list" id="exec-list">
+                        <div class="empty-state">No trades yet</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <span>Ultra Dads Minter Bot • Railway Deployment</span>
+            <span id="uptime">—</span>
+        </footer>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
