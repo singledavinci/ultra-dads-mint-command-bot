@@ -3,6 +3,7 @@
  */
 
 import assert from 'node:assert';
+import fs from 'node:fs';
 import {
     parseDropMintTimeArg,
     pendingScheduledMints,
@@ -77,6 +78,23 @@ console.log('Test: pendingScheduledMints filters by user...');
 console.log('Test: DROP_MINT_CATCHUP_GRACE_MS default...');
 {
     assert(DROP_MINT_CATCHUP_GRACE_MS >= 60_000);
+    console.log('  OK');
+}
+
+console.log('Test: inactive MintDash access gate precedes scheduled RPC work...');
+{
+    const source = fs.readFileSync(
+        new URL('../src/bot/handlers/dropMintScheduler.ts', import.meta.url),
+        'utf8'
+    );
+    const fireStart = source.indexOf('export async function fireScheduledMint');
+    const fireEnd = source.indexOf('export type ScheduleDropMintResult', fireStart);
+    const fireBody = source.slice(fireStart, fireEnd);
+    const accessGate = fireBody.indexOf('hasActiveMintDashAccess');
+    const providerRead = fireBody.indexOf('getUserProvider');
+    assert(accessGate >= 0, 'scheduled fire must enforce MintDash access');
+    assert(providerRead >= 0, 'scheduled fire must contain its RPC path');
+    assert(accessGate < providerRead, 'access must be checked before RPC/resolver work');
     console.log('  OK');
 }
 

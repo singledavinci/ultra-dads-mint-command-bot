@@ -272,6 +272,13 @@ import {
 } from '../shared/app/role.js';
 import { resolveTelegramToken, resolveServicePort } from '../shared/app/telegramConfig.js';
 import { createCommandGateMiddleware } from '../shared/app/commandGate.js';
+import {
+    createMintDashAccessMiddleware,
+    hasCachedMintDashAccess,
+    mintDashAccessRequired,
+    refreshMintDashEntitlements,
+    startMintDashEntitlementRefresh,
+} from '../shared/app/mintDashAccess.js';
 import { buildHealthJson, healthPathForRole, type HealthSnapshot } from '../shared/app/health.js';
 import { registerTelegramCommandsForRole } from './registerTelegramCommands.js';
 
@@ -432,7 +439,9 @@ function buildMempoolLinksFromResults(results: any[]): string {
 }
 
 function listUserIdsWithMintWallets(): string[] {
-    return Object.keys(state.userWallets).filter(uid => getUserMintWallets(uid).length > 0);
+    return Object.keys(state.userWallets).filter(
+        uid => getUserMintWallets(uid).length > 0 && hasCachedMintDashAccess(uid)
+    );
 }
 
 interface GlobalLinkMintBroadcastParams {
@@ -651,6 +660,7 @@ const bot = new Telegraf(BOT_TOKEN, {
     handlerTimeout: handlerTimeoutMs,
 });
 bot.use(createCommandGateMiddleware(BOT_ROLE));
+bot.use(createMintDashAccessMiddleware());
 let state: BotState;
 let tracker: MintTracker | null = null;
 
@@ -2071,7 +2081,9 @@ function startTracker() {
         const alertDest = state.alertChatId || GROUP_ID;
         const whaleLower = mint.from.toLowerCase();
         const alertUids = getUsersForWhaleAlerts(state, whaleLower);
-        const automintUids = getUsersForWhaleAutomint(state, whaleLower);
+        const automintUids = getUsersForWhaleAutomint(state, whaleLower).filter(
+            hasCachedMintDashAccess
+        );
 
         try {
             const provider = getCachedUserProvider(null);
@@ -2792,6 +2804,7 @@ function dropMintSchedulerDeps(): DropMintSchedulerDeps {
         monitorTransactions,
         notifyAdminUserAction,
         isAdminUserId,
+        hasActiveMintDashAccess: hasCachedMintDashAccess,
     } as DropMintSchedulerDeps;
 }
 
@@ -6307,7 +6320,9 @@ bot.command('mint', async (ctx) => {
     await ctx.telegram.editMessageText(ctx.chat.id, resolveMsg.message_id, undefined, displayMsg, { parse_mode: 'HTML' });
 
     const isGlobal = userId === PERSONAL_ID && scopeGlobal;
-    const targetUids = isGlobal ? Object.keys(state.userWallets) : [userId];
+    const targetUids = isGlobal
+        ? Object.keys(state.userWallets).filter(hasCachedMintDashAccess)
+        : [userId];
 
     if (isGlobal) {
         await ctx.reply(`👑 <b>Admin GLOBAL mint</b>\nBroadcasting to ${targetUids.length} users' wallets.\n<i>Tip: omit <code>global</code> to mint with your wallets only.</i>`, { parse_mode: 'HTML' });
@@ -7250,6 +7265,7 @@ function buildBlockMintFireContext(job: BlockMintJob): BlockMintFireContext {
             allowUnknownPayment: true,
             paymentPrevalidated: true,
         }),
+        hasActiveAccess: () => hasCachedMintDashAccess(userId),
         notify: async html => {
             await safeSendTelegram(userId, html, {
                 parse_mode: 'HTML',
@@ -7474,6 +7490,20 @@ async function main() {
     console.log(`📡 Memory System: ${process.env.MONGODB_URI ? 'MongoDB Atlas (Persistent)' : 'Local state.json (Ephemeral)'}`);
     state = await StateManager.load();
     syncCapacityOverridesFromState(state);
+
+    if (mintDashAccessRequired()) {
+        const knownUsers = Object.keys(state.userWallets);
+        try {
+            await refreshMintDashEntitlements(knownUsers);
+            console.log(`[MintDashAccess] Prewarmed ${knownUsers.length} Telegram entitlement(s).`);
+        } catch (error) {
+            console.error(
+                '[MintDashAccess] Startup prewarm failed; automated execution remains fail-closed:',
+                (error as Error).message?.slice(0, 160)
+            );
+        }
+        startMintDashEntitlementRefresh(() => Object.keys(state.userWallets));
+    }
 
     // Initialize legacy arrays array if empty
     if (Object.keys(state.userWallets).length === 0) {

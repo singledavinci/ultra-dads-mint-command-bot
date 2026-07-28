@@ -138,6 +138,7 @@ export interface BlockMintFireContext {
     provider: JsonRpcProvider;
     privateKeys: string[];
     options: Record<string, unknown>;
+    hasActiveAccess?: () => boolean;
     notify: (html: string) => Promise<void>;
     /** Optional — wait for receipts, NFT metadata, compact admin report */
     onResults?: (
@@ -149,6 +150,13 @@ export interface BlockMintFireContext {
 }
 
 async function fireJob(job: BlockMintJob, blockNumber: number, ctx: BlockMintFireContext): Promise<void> {
+    if (ctx.hasActiveAccess && !ctx.hasActiveAccess()) {
+        await ctx.notify('🔒 Block mint cancelled — MintDash subscription is no longer active.');
+        job.fired = true;
+        job.cancelled = true;
+        disarmBlockMint(job.id);
+        return;
+    }
     if (!ctx.privateKeys.length) {
         await ctx.notify('⚠️ Block mint aborted — no wallets.');
         job.fired = true;
