@@ -7,7 +7,7 @@ ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit && npm cache clean --force
 
-COPY tsconfig.json tsconfig.bot.json ./
+COPY tsconfig.bot.json ./
 COPY scripts ./scripts
 COPY src ./src
 COPY tests ./tests
