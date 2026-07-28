@@ -1495,6 +1495,7 @@ function startProfitCron() {
 // HTTP Server for Render to bind to a port and Serve Dashboard
 const app = express();
 const PORT = resolveServicePort(BOT_ROLE, env.PORT);
+const HEALTH_ONLY_MODE = process.env.BOT_RUNTIME_MODE?.trim().toLowerCase() === 'health-only';
 
 // IMPORTANT: Parse JSON bodies BEFORE any POST route handlers
 app.use(express.json());
@@ -1538,7 +1539,18 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-const telegramWebhookConfig = resolveTelegramWebhookConfig();
+app.use((req, res, next) => {
+    if (!HEALTH_ONLY_MODE || req.path === '/health' || req.path.startsWith('/health/')) {
+        next();
+        return;
+    }
+    res.status(503).json({
+        ok: false,
+        error: 'Service is staged in health-only mode.',
+    });
+});
+
+const telegramWebhookConfig = HEALTH_ONLY_MODE ? null : resolveTelegramWebhookConfig();
 if (telegramWebhookConfig) {
     app.use(
         bot.webhookCallback(telegramWebhookConfig.path, {
@@ -1571,7 +1583,11 @@ function buildRoleHealthSnapshot(): HealthSnapshot {
         role: BOT_ROLE,
         tracker: trackerRunning,
         mongo: StateManager.isConnected() ? 'connected' : 'disconnected',
-        telegramMode: telegramWebhookConfig ? 'webhook' : 'polling',
+        telegramMode: HEALTH_ONLY_MODE
+            ? 'health-only'
+            : telegramWebhookConfig
+              ? 'webhook'
+              : 'polling',
     };
 }
 
@@ -7658,4 +7674,10 @@ async function main() {
     process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 }
 
-main();
+if (HEALTH_ONLY_MODE) {
+    console.warn(
+        `[Boot] ${SERVICE_NAME} is staged in health-only mode; Telegram, trackers, schedulers, and transaction execution are disabled.`
+    );
+} else {
+    main();
+}
