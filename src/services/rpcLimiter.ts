@@ -195,8 +195,31 @@ export async function withSerializedRpc<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export function getLinkMintRpcGapMs(): number {
-    const v = parseInt(process.env.LINK_MINT_RPC_GAP_MS || '220', 10);
-    return Number.isFinite(v) && v >= 0 ? v : 220;
+    const explicit = process.env.LINK_MINT_RPC_GAP_MS?.trim();
+    const configured = (
+        process.env.EXECUTION_RPC_URL ||
+        process.env.PROVIDER_URL ||
+        ''
+    )
+        .split(',')[0]
+        ?.trim();
+    const dedicated = (() => {
+        if (!configured) return false;
+        try {
+            const host = new URL(configured).hostname.toLowerCase();
+            return (
+                host === '10.66.66.1' ||
+                host === '127.0.0.1' ||
+                host === 'localhost' ||
+                host.endsWith('.local')
+            );
+        } catch {
+            return false;
+        }
+    })();
+    const fallback = dedicated ? 0 : 220;
+    const v = parseInt(explicit || String(fallback), 10);
+    return Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
 export async function sleepRpcGap(ms?: number): Promise<void> {

@@ -7621,11 +7621,19 @@ async function main() {
         try {
             await bot.telegram.deleteWebhook({ drop_pending_updates: true });
             await new Promise(r => setTimeout(r, 2000));
-            await bot.launch({ dropPendingUpdates: true });
-            telegramReady = 'ready';
-            console.log('✅ Telegram bot polling started!');
-            await runPostLaunchAnnounce();
+            telegramReady = 'not_ready';
+            await bot.launch({ dropPendingUpdates: true }, () => {
+                // Telegraf's polling promise remains pending for the lifetime of
+                // the bot. Its launch callback fires once getMe succeeds and the
+                // long-polling startup path has been entered.
+                telegramReady = 'ready';
+                console.log('✅ Telegram bot polling started!');
+                void runPostLaunchAnnounce().catch((announceErr) =>
+                    console.error('[AutoAnnounce] Post-launch task failed:', announceErr)
+                );
+            });
         } catch (err: any) {
+            telegramReady = 'not_ready';
             if (err.message?.includes('409') && retries > 0) {
                 console.warn(
                     `⚠️ Telegram 409: another process is polling this token. ` +

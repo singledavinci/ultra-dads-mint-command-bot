@@ -1,9 +1,73 @@
 import { formatEther } from 'ethers';
+import { appendFile, mkdir } from 'node:fs/promises';
+import path from 'node:path';
 import type { ExecutionResult } from '../types/copyMint';
 
 const TELEGRAM_MAX = 3900;
 
 export class ExecutionReporter {
+    static toTelemetryPayload(
+        result: ExecutionResult,
+        phase: 'submitted' | 'confirmed' = 'submitted'
+    ): Record<string, unknown> {
+        return {
+            event: 'mint_execution',
+            phase,
+            executionId: result.executionId,
+            triggerType: result.triggerType,
+            sourceTxHash: result.sourceTxHash,
+            targetContract: result.targetContract,
+            walletCount: result.walletCount,
+            skippedCount: result.skippedCount,
+            submittedCount: result.submittedCount,
+            confirmedCount: result.confirmedCount,
+            revertedCount: result.revertedCount,
+            timeoutCount: result.timeoutCount,
+            failedCount: result.failedCount,
+            detectionLatencyMs: result.detectionLatencyMs,
+            classificationLatencyMs: result.classificationLatencyMs,
+            preflightLatencyMs: result.preflightLatencyMs,
+            broadcastLatencyMs: result.broadcastLatencyMs,
+            confirmationLatencyMs: result.confirmationLatencyMs,
+            totalToBroadcastMs:
+                result.detectionLatencyMs +
+                result.classificationLatencyMs +
+                result.preflightLatencyMs +
+                result.broadcastLatencyMs,
+            errorsByCategory: result.errorsByCategory,
+            txHashes: result.receipts
+                .map(r => r.mintTxHash || r.txHash)
+                .filter((hash): hash is string => Boolean(hash)),
+            createdAt: result.createdAt,
+            recordedAt: Date.now(),
+        };
+    }
+
+    /**
+     * Emit machine-readable timing to Docker logs and a JSONL ledger on the
+     * persistent /app/data volume. Telemetry failure never blocks a mint.
+     */
+    static async recordTelemetry(
+        result: ExecutionResult,
+        phase: 'submitted' | 'confirmed' = 'submitted'
+    ): Promise<void> {
+        const payload = ExecutionReporter.toTelemetryPayload(result, phase);
+        console.log(`[ExecutionTiming] ${JSON.stringify(payload)}`);
+        if (process.env.EXECUTION_LEDGER_ENABLED === 'false') return;
+        try {
+            const dataDir = process.env.DATA_DIR?.trim() || path.resolve('data');
+            await mkdir(dataDir, { recursive: true });
+            const day = new Date().toISOString().slice(0, 10);
+            await appendFile(
+                path.join(dataDir, `execution-ledger-${day}.jsonl`),
+                `${JSON.stringify(payload)}\n`,
+                'utf8'
+            );
+        } catch (err) {
+            console.warn('[ExecutionTiming] ledger write failed:', (err as Error).message);
+        }
+    }
+
     static toTelegramSummary(result: ExecutionResult): string {
         const p = result.paymentPlan;
         const lines = [
