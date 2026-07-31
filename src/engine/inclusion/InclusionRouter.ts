@@ -158,13 +158,14 @@ export class InclusionRouter {
 
         // Auth/signature failures are configuration bugs — never burn the fire on a dead relay.
         // Fall back to Direct RPC blast so FCFS / link mints still land.
-        const authFail = /invalid flashbots signature|unauthorized|flashbots.?auth|invalid signature/i.test(
-            lastError
-        );
-        if (authFail || cfg.builderAllowPublicFallback) {
-            const via = authFail ? 'private_rpc_direct' : 'public';
+        const relayFail =
+            /invalid flashbots signature|unauthorized|flashbots.?auth|invalid signature|block not found/i.test(
+                lastError
+            );
+        if (relayFail || cfg.builderAllowPublicFallback) {
+            const via = relayFail ? 'private_rpc_direct' : 'public';
             inclusionMetrics.lastError = `${lastError} — falling back to ${via}`;
-            inclusionMetrics.directRpcBlasts += authFail ? broadcastable.length : 0;
+            inclusionMetrics.directRpcBlasts += relayFail ? broadcastable.length : 0;
             const receipts: WalletReceipt[] = [];
             for (const plan of plans) {
                 if (!plan.canBroadcast) {
@@ -173,7 +174,7 @@ export class InclusionRouter {
                 }
                 receipts.push(
                     await PublicBroadcastAdapter.broadcast(provider, plan, {
-                        blast: authFail,
+                        blast: relayFail,
                         blastRpcUrls: opts?.blastRpcUrls,
                     })
                 );

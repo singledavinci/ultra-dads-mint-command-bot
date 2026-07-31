@@ -40,13 +40,15 @@ export class FlashbotsBuilder implements BuilderAdapter {
         const txs = orderBundleTxs(spec.txs);
         const blockHex = '0x' + spec.targetBlock.toString(16);
 
+        // Target block is usually head+N (not mined yet). stateBlockNumber must be an
+        // existing block — using the future target returns "block not found".
         const result = await this.rpc<{ results?: CallBundleTxResult[]; coinbaseDiff?: string }>(
             'eth_callBundle',
             [
                 {
                     txs,
                     blockNumber: blockHex,
-                    stateBlockNumber: blockHex,
+                    stateBlockNumber: 'latest',
                 },
             ]
         );

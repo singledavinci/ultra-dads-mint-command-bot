@@ -9,6 +9,7 @@
 
 import { escapeHtml, uiConfidenceBadge, uiRow, uiScreen } from '../bot/ui/premiumMessages';
 import { resolveDropTarget } from '../utils/dropResolver';
+import { fetchCollectionEnrichment, formatEthCompact } from './collectionEnrichment';
 import {
     linkMintDedupeKey,
     markLinkMintExecuted,
@@ -96,6 +97,12 @@ export interface ResolvedMintTarget {
     chainSlug: string;
     platform: MintTargetType;
     name: string;
+    /** Collection banner (Telegram photo) when enrichment succeeds */
+    bannerUrl?: string;
+    /** Collection image / logo fallback for photo */
+    imageUrl?: string;
+    floorEth?: number;
+    openseaUrl?: string;
     confidence: 'high' | 'medium' | 'low';
     sourceUrl?: string;
     warnings: string[];
@@ -300,6 +307,35 @@ export function detectMintTargetFromMessage(text: string): MintTargetCandidate[]
  */
 const DEFAULT_RESOLVE_DEADLINE_MS = parseInt(process.env.LINK_MINT_RESOLVE_DEADLINE_MS || '28000', 10);
 
+function nameLooksPlaceholder(name: string | undefined, contract: string): boolean {
+    const n = (name || '').trim();
+    if (!n || n === 'Unknown') return true;
+    const short = contract.slice(0, 10) + '...';
+    if (n === short || n === contract) return true;
+    return /^0x[a-fA-F0-9]{4,10}\.\.\.?$/i.test(n);
+}
+
+/** Best-effort OpenSea/Reservoir name + banner for Telegram preview. */
+export async function attachCollectionEnrichment(
+    target: ResolvedMintTarget
+): Promise<ResolvedMintTarget> {
+    try {
+        const enrich = await fetchCollectionEnrichment(target.contractAddress);
+        if (enrich.name && nameLooksPlaceholder(target.name, target.contractAddress)) {
+            target.name = enrich.name;
+        } else if (enrich.name && !target.name) {
+            target.name = enrich.name;
+        }
+        target.bannerUrl = enrich.bannerUrl || target.bannerUrl;
+        target.imageUrl = enrich.imageUrl || enrich.bannerUrl || target.imageUrl;
+        if (enrich.floorEth !== undefined) target.floorEth = enrich.floorEth;
+        if (enrich.openseaUrl) target.openseaUrl = enrich.openseaUrl;
+    } catch {
+        /* ignore enrichment failures */
+    }
+    return target;
+}
+
 /** Hard cap so link-mint handler cannot block the Telegram webhook indefinitely. */
 export async function resolveMintTargetWithDeadline(
     candidate: MintTargetCandidate,
@@ -307,7 +343,7 @@ export async function resolveMintTargetWithDeadline(
     simulateFrom?: string,
     deadlineMs: number = DEFAULT_RESOLVE_DEADLINE_MS
 ): Promise<ResolvedMintTarget | null> {
-    return Promise.race([
+    const resolved = await Promise.race([
         resolveMintTarget(candidate, provider, simulateFrom),
         new Promise<never>((_, reject) =>
             setTimeout(
@@ -316,9 +352,20 @@ export async function resolveMintTargetWithDeadline(
             )
         ),
     ]);
+    return resolved;
 }
 
 export async function resolveMintTarget(
+    candidate: MintTargetCandidate,
+    provider?: JsonRpcProvider,
+    simulateFrom?: string
+): Promise<ResolvedMintTarget | null> {
+    const target = await resolveMintTargetCore(candidate, provider, simulateFrom);
+    if (!target) return null;
+    return attachCollectionEnrichment(target);
+}
+
+async function resolveMintTargetCore(
     candidate: MintTargetCandidate,
     provider?: JsonRpcProvider,
     simulateFrom?: string
@@ -878,12 +925,15 @@ export function buildPreviewMessage(
         body += `⏸️ <b>SeaDrop phase</b>\n<i>${escapeHtml(target.seaDropStatus.summary)}</i>\n\n`;
     }
 
-    body += uiRow('Platform', escapeHtml(target.platform)) + '\n';
-    body += uiRow('Collection', `<code>${target.contractAddress}</code>`) + '\n';
+    body += uiRow('Collection', `<b>${escapeHtml(target.name || 'Unknown')}</b>`) + '\n';
+    body += uiRow('Contract', `<code>${target.contractAddress}</code>`) + '\n';
     if (target.executionTo.toLowerCase() !== target.contractAddress.toLowerCase()) {
         body += uiRow('Router', `<code>${target.executionTo}</code>`) + '\n';
     }
-    body += uiRow('Name', escapeHtml(target.name || 'Unknown')) + '\n';
+    body += uiRow('Platform', escapeHtml(target.platform)) + '\n';
+    if (target.floorEth !== undefined) {
+        body += uiRow('Floor', `<b>${formatEthCompact(target.floorEth)}</b> ETH`) + '\n';
+    }
     body += uiRow('Confidence', uiConfidenceBadge(target.confidence)) + '\n';
     body += uiRow('Quantity', `<b>${target.suggestedQuantity}</b>`) + '\n';
     body += uiRow('Per wallet', `<b>${valueEth}</b> ETH`) + '\n';
@@ -908,10 +958,16 @@ export function buildPreviewMessage(
 
     return uiScreen({
         icon: '🎯',
-        title: 'Mint target',
+        title: escapeHtml(target.name || 'Mint target'),
         body,
         footer: `<i>Mode: ${mode}</i>`,
     });
+}
+
+/** Prefer banner, then collection image for Telegram photo previews. */
+export function collectionPhotoUrl(target: ResolvedMintTarget): string | undefined {
+    const url = target.bannerUrl || target.imageUrl;
+    return url && /^https?:\/\//i.test(url) ? url : undefined;
 }
 
 /** @deprecated Use recordLinkMintExecution — kept for callers */

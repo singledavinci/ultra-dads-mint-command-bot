@@ -19,6 +19,7 @@ import {
     buildPreviewMessage,
     loadLinkMintConfig,
     recordLinkMintExecution,
+    collectionPhotoUrl,
 } from '../../services/linkMintService';
 import { rpcRetry, sleepRpcGap, withSerializedRpc } from '../../services/rpcLimiter';
 import type { ResolvedMintTarget, MintTargetCandidate } from '../../services/linkMintService';
@@ -33,8 +34,9 @@ import {
 import { getBatchMintSession } from './batchMintWizard';
 import { dropMintWizardExpectsText } from './dropMintWizard';
 import { formatTelegramUserLabel } from '../telegramFormat';
-import { formatLinkMintResolving, uiScreen } from '../ui/premiumMessages';
+import { escapeHtml, formatLinkMintResolving, uiScreen } from '../ui/premiumMessages';
 import { extractScatterSlug } from '../../services/scatterMint';
+import { inclusionModeForGasTier } from '../../utils/inclusionMode';
 
 function linkMintExecuteOptions(resolved: ResolvedMintTarget, config: ReturnType<typeof loadLinkMintConfig>, extra?: Record<string, unknown>) {
     const scatterSlug =
@@ -43,6 +45,7 @@ function linkMintExecuteOptions(resolved: ResolvedMintTarget, config: ReturnType
             ? extractScatterSlug(resolved.sourceUrl || resolved.input)
             : undefined);
     const scatter = Boolean(scatterSlug);
+    const gasTierId = resolved.suggestedGasTierId || process.env.LINK_MINT_GAS_TIER || 'fcfs_plus';
     return {
         executionTo: resolved.executionTo,
         scatterSlug,
@@ -54,10 +57,41 @@ function linkMintExecuteOptions(resolved: ResolvedMintTarget, config: ReturnType
         simulationMode: config.simulationMode,
         allowUnknownPayment: scatter || Boolean(resolved.allowSimulationBypass),
         skipSimulation: scatter || config.simulationMode === 'fast',
-        gasTierId: resolved.suggestedGasTierId || process.env.LINK_MINT_GAS_TIER || 'fcfs_plus',
+        gasTierId,
+        // FCFS paste-to-mint must not use DEFAULT builder_flashbots (block not found).
+        inclusionMode: inclusionModeForGasTier(gasTierId),
         forceGasEstimate: true,
         ...extra,
     };
+}
+
+async function replyLinkMintPreview(
+    ctx: Context,
+    preview: string,
+    target: ResolvedMintTarget,
+    extra?: Record<string, unknown>
+): Promise<void> {
+    const photo = collectionPhotoUrl(target);
+    const caption = preview.length > 1000 ? `${preview.slice(0, 990)}…` : preview;
+    if (photo) {
+        try {
+            await ctx.replyWithPhoto(photo, {
+                caption,
+                parse_mode: 'HTML',
+                ...extra,
+            });
+            return;
+        } catch {
+            /* fall through to text */
+        }
+    }
+    await ctx.reply(preview, { parse_mode: 'HTML', ...extra }).catch(() => {});
+}
+
+async function editLinkMintStatus(ctx: any, html: string): Promise<void> {
+    await ctx.editMessageCaption(html, { parse_mode: 'HTML' }).catch(async () => {
+        await ctx.editMessageText(html, { parse_mode: 'HTML' }).catch(() => {});
+    });
 }
 
 // Store pending targets for confirmation buttons
@@ -127,12 +161,11 @@ async function processLinkMintResolve(
         const preview = buildPreviewMessage(resolved, wallets.length);
 
         if (!validation.valid) {
-            await ctx
-                .reply(
-                    `${preview}\n\n✗ <b>Cannot mint</b>\n${validation.errors.map(e => `• ${e}`).join('\n')}`,
-                    { parse_mode: 'HTML' }
-                )
-                .catch(() => {});
+            await replyLinkMintPreview(
+                ctx,
+                `${preview}\n\n✗ <b>Cannot mint</b>\n${validation.errors.map(e => `• ${e}`).join('\n')}`,
+                resolved
+            );
             return;
         }
 
@@ -145,9 +178,7 @@ async function processLinkMintResolve(
         });
 
         if (config.autoMintFromLinks && !config.confirmationRequired) {
-            await ctx
-                .reply(`${preview}\n\n⚡ <i>Auto-executing…</i>`, { parse_mode: 'HTML' })
-                .catch(() => {});
+            await replyLinkMintPreview(ctx, `${preview}\n\n⚡ <i>Auto-executing…</i>`, resolved);
             try {
                 await executeMint(
                     userId,
@@ -177,7 +208,7 @@ async function processLinkMintResolve(
             ],
         ]);
 
-        await ctx.reply(preview, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
+        await replyLinkMintPreview(ctx, preview, resolved, keyboard);
     } catch (err) {
         if (statusMsgId) {
             await ctx.telegram.deleteMessage(chatId, statusMsgId).catch(() => {});
@@ -281,7 +312,12 @@ export function registerLinkMintHandler(
         pendingTargets.delete(targetId);
 
         ctx.answerCbQuery('Executing...');
-        await ctx.editMessageText(`🚀 <b>Executing mint...</b>\nContract: <code>${pending.target.contractAddress}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+        await editLinkMintStatus(
+            ctx,
+            `🚀 <b>Executing mint...</b>\n` +
+                `<b>${escapeHtml(pending.target.name || 'Mint')}</b>\n` +
+                `Contract: <code>${pending.target.contractAddress}</code>`
+        );
 
         try {
             await executeMint(
@@ -309,12 +345,13 @@ export function registerLinkMintHandler(
         const prov = getProvider?.();
         const wallets = getUserWallets(pending.userId);
         if (!prov || !wallets[0]) {
-            await ctx
-                .editMessageText(
-                    `🧪 <b>Dry Run</b>\nContract: <code>${pending.target.contractAddress}</code>\n<i>No RPC or wallet — cannot simulate.</i>`,
-                    { parse_mode: 'HTML' }
-                )
-                .catch(() => {});
+            await editLinkMintStatus(
+                ctx,
+                `🧪 <b>Dry Run</b>\n` +
+                    `<b>${escapeHtml(pending.target.name || 'Mint')}</b>\n` +
+                    `Contract: <code>${pending.target.contractAddress}</code>\n` +
+                    `<i>No RPC or wallet — cannot simulate.</i>`
+            );
             return;
         }
         try {
@@ -331,17 +368,21 @@ export function registerLinkMintHandler(
                     'linkDryRun'
                 );
             });
-            await ctx
-                .editMessageText(
-                    `🧪 <b>Dry Run OK</b>\nContract: <code>${pending.target.contractAddress}</code>\nSelector: <code>${pending.target.detectedSelector}</code>\nGas estimate: <code>${gas.toString()}</code>\n<i>No funds spent.</i>`,
-                    { parse_mode: 'HTML' }
-                )
-                .catch(() => {});
+            await editLinkMintStatus(
+                ctx,
+                `🧪 <b>Dry Run OK</b>\n` +
+                    `<b>${escapeHtml(pending.target.name || 'Mint')}</b>\n` +
+                    `Contract: <code>${pending.target.contractAddress}</code>\n` +
+                    `Selector: <code>${pending.target.detectedSelector}</code>\n` +
+                    `Gas estimate: <code>${gas.toString()}</code>\n` +
+                    `<i>No funds spent.</i>`
+            );
         } catch (e: any) {
             const msg = (e?.message || e || 'unknown error').toString().slice(0, 400);
-            await ctx
-                .editMessageText(`🧪 <b>Dry Run Failed</b>\n<code>${msg.replace(/</g, '&lt;')}</code>`, { parse_mode: 'HTML' })
-                .catch(() => {});
+            await editLinkMintStatus(
+                ctx,
+                `🧪 <b>Dry Run Failed</b>\n<code>${escapeHtml(msg)}</code>`
+            );
         }
     });
 
@@ -349,13 +390,16 @@ export function registerLinkMintHandler(
         const targetId = ctx.match[1];
         pendingTargets.delete(targetId);
         ctx.answerCbQuery('Cancelled.');
-        await ctx.editMessageText('❌ Link mint cancelled.').catch(() => {});
+        await editLinkMintStatus(ctx, '❌ Link mint cancelled.');
     });
 
     bot.action(/^linkmint_view_(.+)$/, async (ctx: any) => {
         const targetId = ctx.match[1];
         const pending = pendingTargets.get(targetId);
         if (!pending) return ctx.answerCbQuery('Target expired.', { show_alert: true });
-        ctx.answerCbQuery(`https://etherscan.io/address/${pending.target.contractAddress}`, { show_alert: true });
+        const url =
+            pending.target.openseaUrl ||
+            `https://etherscan.io/address/${pending.target.contractAddress}`;
+        ctx.answerCbQuery(url.slice(0, 200), { show_alert: true });
     });
 }
