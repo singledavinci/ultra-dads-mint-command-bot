@@ -1,4 +1,4 @@
-import { keccak256, SigningKey, toUtf8Bytes, Wallet } from 'ethers';
+import { id as ethersId, Wallet } from 'ethers';
 import { getRuntimeConfig } from '../../../config/runtimeConfig';
 import { orderBundleTxs } from '../../../services/bundleAssembler';
 import type {
@@ -40,13 +40,15 @@ export class FlashbotsBuilder implements BuilderAdapter {
         const txs = orderBundleTxs(spec.txs);
         const blockHex = '0x' + spec.targetBlock.toString(16);
 
+        // Target block is usually head+N (not mined yet). stateBlockNumber must be an
+        // existing block — using the future target returns "block not found".
         const result = await this.rpc<{ results?: CallBundleTxResult[]; coinbaseDiff?: string }>(
             'eth_callBundle',
             [
                 {
                     txs,
                     blockNumber: blockHex,
-                    stateBlockNumber: blockHex,
+                    stateBlockNumber: 'latest',
                 },
             ]
         );
@@ -179,11 +181,14 @@ export class FlashbotsBuilder implements BuilderAdapter {
     }
 }
 
+/**
+ * Flashbots relay auth: `Address:signMessage(keccak256(body))` (EIP-191).
+ * Must use wallet.signMessage / signMessageSync — raw secp256k1 over the
+ * keccak digest is rejected as "invalid flashbots signature".
+ */
 function signFlashbotsBody(body: string, privateKey: string): string {
     const pk = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
-    const signingKey = new SigningKey(pk);
-    const wallet = new Wallet(signingKey);
-    const bodyHash = keccak256(toUtf8Bytes(body));
-    const sig = signingKey.sign(bodyHash);
-    return `${wallet.address}:${sig.serialized}`;
+    const wallet = new Wallet(pk);
+    const signature = wallet.signMessageSync(ethersId(body));
+    return `${wallet.address}:${signature}`;
 }

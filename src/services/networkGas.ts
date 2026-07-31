@@ -1,14 +1,21 @@
 /**
- * Live network gas — shared by gas advisor UI and execution (GasPlanner).
- * Avoids hardcoded gwei fallbacks when the chain reports current fees.
+ * Live network gas — MintDash-aligned feeHistory tiers.
+ * Network (`normal`): P10 tip, maxFee = nextBase + tip (no ×1.15).
+ * Competitive (fcfs*): fixed tip floors + base*2 headroom (inclusion may raise further).
  */
 
 import { FeeData, formatUnits, JsonRpcProvider, parseUnits } from 'ethers';
 import { getRuntimeConfig } from '../config/runtimeConfig';
 import { getCachedFeeData } from './rpcLimiter';
+import {
+    estimateNetworkGas,
+    networkTierForBotTier,
+    type NetworkGasEstimate,
+} from './networkFeeEstimate';
 
 export interface LiveNetworkFees {
     feeData: FeeData;
+    /** Next-block base fee (not maxFee). */
     baseMaxFee: bigint;
     basePriorityFee: bigint;
     baseMaxFeeGwei: number;
@@ -22,13 +29,23 @@ export interface GasTierFees {
     priorityGwei: number;
     overdrive: boolean;
     gasBribeGwei: string;
+    baseFeeWei: bigint;
+    isNetworkTier: boolean;
 }
+
+/** Competitive tip floors (gwei) — MintDash FCFS_8 / FCFS_15 / Sniper style. */
+const COMPETITIVE_TIP_FLOOR_GWEI: Record<string, number> = {
+    fcfs: 3,
+    fcfs_plus: 8,
+    fcfs_max: 15,
+    overdrive: 30,
+};
 
 export const GAS_TIER_DEFS = [
     {
         id: 'normal',
         label: '🐢 Normal',
-        hint: 'Network ×1.15 — OK for low competition',
+        hint: 'Live network (feeHistory P10) — no buffer',
         bribeGwei: 0,
         builderTipEth: 0,
         overdrive: false,
@@ -38,38 +55,38 @@ export const GAS_TIER_DEFS = [
     {
         id: 'fcfs',
         label: '⚡ FCFS +3',
-        hint: '+3 gwei priority — light snipe (public mempool)',
+        hint: '3 gwei tip floor — light snipe',
         bribeGwei: 3,
         builderTipEth: 0,
         overdrive: false,
-        maxBumpGwei: 3,
-        priBumpGwei: 3,
+        maxBumpGwei: 0,
+        priBumpGwei: 0,
     },
     {
         id: 'fcfs_plus',
         label: '🔥 FCFS +8',
-        hint: '+8 gwei + ~0.004 ETH priority boost (bundle)',
+        hint: '8 gwei tip floor + Direct RPC',
         bribeGwei: 8,
         builderTipEth: 0.004,
         overdrive: false,
-        maxBumpGwei: 8,
-        priBumpGwei: 8,
+        maxBumpGwei: 0,
+        priBumpGwei: 0,
     },
     {
         id: 'fcfs_max',
         label: '🚀 FCFS +15',
-        hint: '+15 gwei + ~0.008 ETH priority boost (bundle)',
+        hint: '15 gwei tip floor + Direct RPC',
         bribeGwei: 15,
         builderTipEth: 0.008,
         overdrive: false,
-        maxBumpGwei: 15,
-        priBumpGwei: 15,
+        maxBumpGwei: 0,
+        priBumpGwei: 0,
     },
     {
         id: 'overdrive',
         label: '💥 Sniper',
-        hint: 'Overdrive caps + ~0.015 ETH priority boost (bundle)',
-        bribeGwei: 15,
+        hint: '30 gwei tip floor + competitive headroom',
+        bribeGwei: 30,
         builderTipEth: 0.015,
         overdrive: true,
         maxBumpGwei: 0,
@@ -81,68 +98,6 @@ export type GasTierId = (typeof GAS_TIER_DEFS)[number]['id'];
 
 function gweiFromWei(wei: bigint): number {
     return parseFloat(formatUnits(wei, 'gwei'));
-}
-
-/** Read current block fees; use fee history only when the node omits EIP-1559 fields. */
-export async function resolveLiveNetworkFees(provider: JsonRpcProvider): Promise<LiveNetworkFees> {
-    const feeData = await getCachedFeeData(provider);
-    let baseMax = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
-    let basePri = feeData.maxPriorityFeePerGas ?? 0n;
-
-    if (!baseMax || baseMax <= 0n) {
-        try {
-            const block = await provider.getBlock('latest');
-            const baseFee = block?.baseFeePerGas ?? 0n;
-            if (baseFee > 0n) {
-                basePri = basePri > 0n ? basePri : parseUnits('0.1', 'gwei');
-                baseMax = baseFee * 2n + basePri;
-            }
-        } catch {
-            /* try fee history */
-        }
-    }
-
-    if (!baseMax || baseMax <= 0n) {
-        try {
-            const hist = (await provider.send('eth_feeHistory', [
-                4,
-                'latest',
-                [50],
-            ])) as {
-                baseFeePerGas?: string[];
-                reward?: string[][];
-            };
-            const bases = hist?.baseFeePerGas || [];
-            const rewards = hist?.reward || [];
-            const baseFee = bases.length ? BigInt(bases[bases.length - 1]) : 0n;
-            const tip =
-                rewards.length && rewards[rewards.length - 1]?.[0]
-                    ? BigInt(rewards[rewards.length - 1][0])
-                    : parseUnits('0.1', 'gwei');
-            if (baseFee > 0n) {
-                basePri = tip;
-                baseMax = baseFee * 2n + tip;
-            }
-        } catch {
-            /* last resort below */
-        }
-    }
-
-    if (!baseMax || baseMax <= 0n) {
-        baseMax = parseUnits('1', 'gwei');
-    }
-    if (!basePri || basePri <= 0n) {
-        basePri = baseMax / 20n > 0n ? baseMax / 20n : parseUnits('0.05', 'gwei');
-    }
-    if (basePri > baseMax) basePri = baseMax;
-
-    return {
-        feeData,
-        baseMaxFee: baseMax,
-        basePriorityFee: basePri,
-        baseMaxFeeGwei: gweiFromWei(baseMax),
-        basePriorityFeeGwei: gweiFromWei(basePri),
-    };
 }
 
 function applyCaps(maxFee: bigint, priority: bigint, overdrive: boolean): { maxFee: bigint; priority: bigint } {
@@ -158,7 +113,105 @@ function applyCaps(maxFee: bigint, priority: bigint, overdrive: boolean): { maxF
     return { maxFee: mf, priority: mp };
 }
 
-/** Apply a gas-advisor tier to live network base fees (same math as the /mint picker). */
+/**
+ * Live fees for UI: next-block base + MARKET tip (P50).
+ * baseMaxFee here is the base fee (not maxFeePerGas) for clearer advisor labels.
+ */
+export async function resolveLiveNetworkFees(provider: JsonRpcProvider): Promise<LiveNetworkFees> {
+    let feeData: FeeData;
+    try {
+        feeData = await getCachedFeeData(provider);
+    } catch {
+        feeData = new FeeData(null, null, null);
+    }
+
+    try {
+        const est = await estimateNetworkGas(provider, 'MARKET');
+        return {
+            feeData,
+            baseMaxFee: est.baseFeeWei,
+            basePriorityFee: est.maxPriorityFeePerGasWei,
+            baseMaxFeeGwei: gweiFromWei(est.baseFeeWei),
+            basePriorityFeeGwei: gweiFromWei(est.maxPriorityFeePerGasWei),
+        };
+    } catch {
+        /* fall through */
+    }
+
+    let base = feeData.maxFeePerGas ?? feeData.gasPrice ?? parseUnits('1', 'gwei');
+    let tip = feeData.maxPriorityFeePerGas ?? parseUnits('0.05', 'gwei');
+    try {
+        const block = await provider.getBlock('latest');
+        if (block?.baseFeePerGas && block.baseFeePerGas > 0n) base = block.baseFeePerGas;
+    } catch {
+        /* keep */
+    }
+    if (tip > base * 2n) tip = base / 10n > 0n ? base / 10n : tip;
+
+    return {
+        feeData,
+        baseMaxFee: base,
+        basePriorityFee: tip,
+        baseMaxFeeGwei: gweiFromWei(base),
+        basePriorityFeeGwei: gweiFromWei(tip),
+    };
+}
+
+function fromEstimate(est: NetworkGasEstimate, overdrive: boolean, bribeGwei: number, isNetwork: boolean): GasTierFees {
+    const capped = applyCaps(est.maxFeePerGasWei, est.maxPriorityFeePerGasWei, overdrive);
+    return {
+        maxFeePerGas: capped.maxFee,
+        maxPriorityFeePerGas: capped.priority,
+        maxFeeGwei: gweiFromWei(capped.maxFee),
+        priorityGwei: gweiFromWei(capped.priority),
+        overdrive,
+        gasBribeGwei: String(bribeGwei),
+        baseFeeWei: est.baseFeeWei,
+        isNetworkTier: isNetwork,
+    };
+}
+
+/**
+ * Async tier fees (preferred). Network tiers use feeHistory; competitive use tip floors.
+ */
+export async function computeGasFeesForTierAsync(
+    provider: JsonRpcProvider,
+    tierId: string
+): Promise<GasTierFees | null> {
+    const def = GAS_TIER_DEFS.find(t => t.id === tierId);
+    if (!def) return null;
+
+    const networkTier = networkTierForBotTier(tierId);
+    if (networkTier) {
+        const est = await estimateNetworkGas(provider, networkTier);
+        return fromEstimate(est, false, 0, true);
+    }
+
+    // Competitive: MARKET base + fixed tip floor (no ×1.15, no stacked bribes).
+    const market = await estimateNetworkGas(provider, 'MARKET');
+    const tipFloorGwei = COMPETITIVE_TIP_FLOOR_GWEI[tierId] ?? def.bribeGwei;
+    const tipFloor = parseUnits(String(tipFloorGwei), 'gwei');
+    let priority = tipFloor > market.maxPriorityFeePerGasWei ? tipFloor : market.maxPriorityFeePerGasWei;
+    // Prefer the competitive floor when it's the defining trait of the tier.
+    priority = tipFloor;
+    let maxFee = market.baseFeeWei * 2n + priority;
+    const capped = applyCaps(maxFee, priority, def.overdrive);
+    return {
+        maxFeePerGas: capped.maxFee,
+        maxPriorityFeePerGas: capped.priority,
+        maxFeeGwei: gweiFromWei(capped.maxFee),
+        priorityGwei: gweiFromWei(capped.priority),
+        overdrive: def.overdrive,
+        gasBribeGwei: String(tipFloorGwei),
+        baseFeeWei: market.baseFeeWei,
+        isNetworkTier: false,
+    };
+}
+
+/**
+ * Sync helper for tests / when live base+tip already resolved.
+ * Network: maxFee = base + tip (no multiplier). Competitive: tip floor + base*2.
+ */
 export function computeGasFeesForTier(
     live: Pick<LiveNetworkFees, 'baseMaxFee' | 'basePriorityFee'>,
     tierId: string
@@ -166,40 +219,36 @@ export function computeGasFeesForTier(
     const def = GAS_TIER_DEFS.find(t => t.id === tierId);
     if (!def) return null;
 
-    const cfg = getRuntimeConfig();
-    let maxFee = live.baseMaxFee;
-    let priority = live.basePriorityFee;
-
-    if (def.overdrive) {
-        maxFee = (maxFee * 400n) / 100n;
-        priority = (priority * 150n) / 100n;
-    } else {
-        maxFee = (maxFee * BigInt(Math.round(cfg.normalGasMultiplier * 100))) / 100n;
-        priority = (priority * BigInt(Math.round(cfg.normalGasMultiplier * 100))) / 100n;
+    const networkTier = networkTierForBotTier(tierId);
+    if (networkTier) {
+        // live.baseMaxFee is next-block base; tip from live.basePriorityFee (caller should use P10 for normal).
+        const tip = live.basePriorityFee > 0n ? live.basePriorityFee : parseUnits('0.01', 'gwei');
+        const maxFee = live.baseMaxFee + tip; // LOW-style 1× headroom
+        const capped = applyCaps(maxFee, tip, false);
+        return {
+            maxFeePerGas: capped.maxFee,
+            maxPriorityFeePerGas: capped.priority,
+            maxFeeGwei: gweiFromWei(capped.maxFee),
+            priorityGwei: gweiFromWei(capped.priority),
+            overdrive: false,
+            gasBribeGwei: '0',
+            baseFeeWei: live.baseMaxFee,
+            isNetworkTier: true,
+        };
     }
 
-    if (def.maxBumpGwei > 0) {
-        maxFee += parseUnits(String(def.maxBumpGwei), 'gwei');
-    }
-    if (def.priBumpGwei > 0) {
-        priority += parseUnits(String(def.priBumpGwei), 'gwei');
-    }
-    if (def.bribeGwei > 0) {
-        const bribe = parseUnits(String(def.bribeGwei), 'gwei');
-        priority += bribe;
-        maxFee += bribe;
-    }
-
+    const tipFloorGwei = COMPETITIVE_TIP_FLOOR_GWEI[tierId] ?? def.bribeGwei;
+    const priority = parseUnits(String(tipFloorGwei), 'gwei');
+    const maxFee = live.baseMaxFee * 2n + priority;
     const capped = applyCaps(maxFee, priority, def.overdrive);
-    maxFee = capped.maxFee;
-    priority = capped.priority;
-
     return {
-        maxFeePerGas: maxFee,
-        maxPriorityFeePerGas: priority,
-        maxFeeGwei: gweiFromWei(maxFee),
-        priorityGwei: gweiFromWei(priority),
+        maxFeePerGas: capped.maxFee,
+        maxPriorityFeePerGas: capped.priority,
+        maxFeeGwei: gweiFromWei(capped.maxFee),
+        priorityGwei: gweiFromWei(capped.priority),
         overdrive: def.overdrive,
-        gasBribeGwei: String(def.bribeGwei),
+        gasBribeGwei: String(tipFloorGwei),
+        baseFeeWei: live.baseMaxFee,
+        isNetworkTier: false,
     };
 }

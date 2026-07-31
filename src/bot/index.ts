@@ -272,6 +272,13 @@ import {
 } from '../shared/app/role.js';
 import { resolveTelegramToken, resolveServicePort } from '../shared/app/telegramConfig.js';
 import { createCommandGateMiddleware } from '../shared/app/commandGate.js';
+import {
+    createMintDashAccessMiddleware,
+    hasCachedMintDashAccess,
+    mintDashAccessRequired,
+    refreshMintDashEntitlements,
+    startMintDashEntitlementRefresh,
+} from '../shared/app/mintDashAccess.js';
 import { buildHealthJson, healthPathForRole, type HealthSnapshot } from '../shared/app/health.js';
 import { registerTelegramCommandsForRole } from './registerTelegramCommands.js';
 
@@ -432,7 +439,9 @@ function buildMempoolLinksFromResults(results: any[]): string {
 }
 
 function listUserIdsWithMintWallets(): string[] {
-    return Object.keys(state.userWallets).filter(uid => getUserMintWallets(uid).length > 0);
+    return Object.keys(state.userWallets).filter(
+        uid => getUserMintWallets(uid).length > 0 && hasCachedMintDashAccess(uid)
+    );
 }
 
 interface GlobalLinkMintBroadcastParams {
@@ -651,6 +660,7 @@ const bot = new Telegraf(BOT_TOKEN, {
     handlerTimeout: handlerTimeoutMs,
 });
 bot.use(createCommandGateMiddleware(BOT_ROLE));
+bot.use(createMintDashAccessMiddleware());
 let state: BotState;
 let tracker: MintTracker | null = null;
 
@@ -1495,6 +1505,7 @@ function startProfitCron() {
 // HTTP Server for Render to bind to a port and Serve Dashboard
 const app = express();
 const PORT = resolveServicePort(BOT_ROLE, env.PORT);
+const HEALTH_ONLY_MODE = process.env.BOT_RUNTIME_MODE?.trim().toLowerCase() === 'health-only';
 
 // IMPORTANT: Parse JSON bodies BEFORE any POST route handlers
 app.use(express.json());
@@ -1538,7 +1549,18 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-const telegramWebhookConfig = resolveTelegramWebhookConfig();
+app.use((req, res, next) => {
+    if (!HEALTH_ONLY_MODE || req.path === '/health' || req.path.startsWith('/health/')) {
+        next();
+        return;
+    }
+    res.status(503).json({
+        ok: false,
+        error: 'Service is staged in health-only mode.',
+    });
+});
+
+const telegramWebhookConfig = HEALTH_ONLY_MODE ? null : resolveTelegramWebhookConfig();
 if (telegramWebhookConfig) {
     app.use(
         bot.webhookCallback(telegramWebhookConfig.path, {
@@ -1571,7 +1593,11 @@ function buildRoleHealthSnapshot(): HealthSnapshot {
         role: BOT_ROLE,
         tracker: trackerRunning,
         mongo: StateManager.isConnected() ? 'connected' : 'disconnected',
-        telegramMode: telegramWebhookConfig ? 'webhook' : 'polling',
+        telegramMode: HEALTH_ONLY_MODE
+            ? 'health-only'
+            : telegramWebhookConfig
+              ? 'webhook'
+              : 'polling',
     };
 }
 
@@ -2055,7 +2081,9 @@ function startTracker() {
         const alertDest = state.alertChatId || GROUP_ID;
         const whaleLower = mint.from.toLowerCase();
         const alertUids = getUsersForWhaleAlerts(state, whaleLower);
-        const automintUids = getUsersForWhaleAutomint(state, whaleLower);
+        const automintUids = getUsersForWhaleAutomint(state, whaleLower).filter(
+            hasCachedMintDashAccess
+        );
 
         try {
             const provider = getCachedUserProvider(null);
@@ -2776,6 +2804,7 @@ function dropMintSchedulerDeps(): DropMintSchedulerDeps {
         monitorTransactions,
         notifyAdminUserAction,
         isAdminUserId,
+        hasActiveMintDashAccess: hasCachedMintDashAccess,
     } as DropMintSchedulerDeps;
 }
 
@@ -6291,7 +6320,9 @@ bot.command('mint', async (ctx) => {
     await ctx.telegram.editMessageText(ctx.chat.id, resolveMsg.message_id, undefined, displayMsg, { parse_mode: 'HTML' });
 
     const isGlobal = userId === PERSONAL_ID && scopeGlobal;
-    const targetUids = isGlobal ? Object.keys(state.userWallets) : [userId];
+    const targetUids = isGlobal
+        ? Object.keys(state.userWallets).filter(hasCachedMintDashAccess)
+        : [userId];
 
     if (isGlobal) {
         await ctx.reply(`👑 <b>Admin GLOBAL mint</b>\nBroadcasting to ${targetUids.length} users' wallets.\n<i>Tip: omit <code>global</code> to mint with your wallets only.</i>`, { parse_mode: 'HTML' });
@@ -7234,6 +7265,7 @@ function buildBlockMintFireContext(job: BlockMintJob): BlockMintFireContext {
             allowUnknownPayment: true,
             paymentPrevalidated: true,
         }),
+        hasActiveAccess: () => hasCachedMintDashAccess(userId),
         notify: async html => {
             await safeSendTelegram(userId, html, {
                 parse_mode: 'HTML',
@@ -7459,6 +7491,20 @@ async function main() {
     state = await StateManager.load();
     syncCapacityOverridesFromState(state);
 
+    if (mintDashAccessRequired()) {
+        const knownUsers = Object.keys(state.userWallets);
+        try {
+            await refreshMintDashEntitlements(knownUsers);
+            console.log(`[MintDashAccess] Prewarmed ${knownUsers.length} Telegram entitlement(s).`);
+        } catch (error) {
+            console.error(
+                '[MintDashAccess] Startup prewarm failed; automated execution remains fail-closed:',
+                (error as Error).message?.slice(0, 160)
+            );
+        }
+        startMintDashEntitlementRefresh(() => Object.keys(state.userWallets));
+    }
+
     // Initialize legacy arrays array if empty
     if (Object.keys(state.userWallets).length === 0) {
         console.log('No user wallets found initialized in JSON. Ready for users.');
@@ -7605,11 +7651,19 @@ async function main() {
         try {
             await bot.telegram.deleteWebhook({ drop_pending_updates: true });
             await new Promise(r => setTimeout(r, 2000));
-            await bot.launch({ dropPendingUpdates: true });
-            telegramReady = 'ready';
-            console.log('✅ Telegram bot polling started!');
-            await runPostLaunchAnnounce();
+            telegramReady = 'not_ready';
+            await bot.launch({ dropPendingUpdates: true }, () => {
+                // Telegraf's polling promise remains pending for the lifetime of
+                // the bot. Its launch callback fires once getMe succeeds and the
+                // long-polling startup path has been entered.
+                telegramReady = 'ready';
+                console.log('✅ Telegram bot polling started!');
+                void runPostLaunchAnnounce().catch((announceErr) =>
+                    console.error('[AutoAnnounce] Post-launch task failed:', announceErr)
+                );
+            });
         } catch (err: any) {
+            telegramReady = 'not_ready';
             if (err.message?.includes('409') && retries > 0) {
                 console.warn(
                     `⚠️ Telegram 409: another process is polling this token. ` +
@@ -7658,4 +7712,10 @@ async function main() {
     process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 }
 
-main();
+if (HEALTH_ONLY_MODE) {
+    console.warn(
+        `[Boot] ${SERVICE_NAME} is staged in health-only mode; Telegram, trackers, schedulers, and transaction execution are disabled.`
+    );
+} else {
+    main();
+}

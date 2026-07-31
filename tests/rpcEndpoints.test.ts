@@ -54,4 +54,24 @@ assert.strictEqual(getTrackerHttpUrl(), 'https://ankr.example/ws/key');
 restoreEnv();
 console.log('  ✅ http conversion');
 
+console.log('Test 5: blast URLs exclude Flashbots Protect...');
+{
+    const { isPrivateMempoolRpcUrl, resolveBlastRpcUrls } = await import(
+        '../src/engine/inclusion/RawTxBlast.js'
+    );
+    assert.strictEqual(isPrivateMempoolRpcUrl('https://rpc.flashbots.net'), true);
+    assert.strictEqual(isPrivateMempoolRpcUrl('https://rpc.flashbots.net/fast'), true);
+    assert.strictEqual(isPrivateMempoolRpcUrl('https://ethereum.publicnode.com'), false);
+    process.env.EXECUTION_RPC_URL = 'http://10.66.66.1:8545';
+    process.env.BACKUP_RPC_URLS =
+        'https://ethereum.publicnode.com,https://rpc.flashbots.net,https://1rpc.io/eth';
+    process.env.PROVIDER_URL = 'http://10.66.66.1:8545';
+    const urls = resolveBlastRpcUrls();
+    assert(!urls.some(u => u.includes('flashbots')), 'protect excluded from blast');
+    assert(urls.includes('http://10.66.66.1:8545'));
+    assert(urls.includes('https://ethereum.publicnode.com'));
+    restoreEnv();
+    console.log('  ✅ protect filtered from Direct blast');
+}
+
 console.log('\n✅ All rpcEndpoints tests passed.\n');

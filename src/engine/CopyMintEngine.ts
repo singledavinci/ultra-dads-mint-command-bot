@@ -180,7 +180,12 @@ export class CopyMintEngine {
                 input.options?.bundleAllWallets &&
                 isBuilderMode(inclusionMode);
 
-            const useStream = effectiveStreamBroadcast() && !useBundle;
+            // Scheduled runs should finish their prepared batch before fire;
+            // incremental wallet #1 streaming is reserved for manual/link/copy fallback paths.
+            const useStream =
+                effectiveStreamBroadcast() &&
+                !useBundle &&
+                input.triggerType !== 'scheduled';
 
             let plans: WalletExecutionPlan[];
             const receipts: WalletReceipt[] = [];
@@ -267,12 +272,16 @@ export class CopyMintEngine {
             };
 
             lastExecution = result;
+            void ExecutionReporter.recordTelemetry(result, 'submitted');
 
             // Non-blocking confirmation (public txs vs builder bundles)
+            const confirmationStartedAt = Date.now();
             void CopyMintEngine.monitorConfirmations(provider, receipts).then(stats => {
                 result.confirmedCount = stats.confirmed;
                 result.revertedCount = stats.reverted;
                 result.timeoutCount = stats.timeout;
+                result.confirmationLatencyMs = Date.now() - confirmationStartedAt;
+                void ExecutionReporter.recordTelemetry(result, 'confirmed');
             });
 
             return result;
@@ -388,7 +397,7 @@ export class CopyMintEngine {
         paymentPlan?: ExecutionResult['paymentPlan'],
         privateKeys: string[] = []
     ): ExecutionResult {
-        return {
+        const result: ExecutionResult = {
             executionId,
             triggerType,
             sourceTxHash: candidate.sourceTxHash,
@@ -449,6 +458,8 @@ export class CopyMintEngine {
                 reason: new Error(reason),
             })),
         };
+        void ExecutionReporter.recordTelemetry(result, 'submitted');
+        return result;
     }
 
     private static wrapLegacy(
@@ -511,6 +522,7 @@ export class CopyMintEngine {
             legacyResults,
         };
         lastExecution = result;
+        void ExecutionReporter.recordTelemetry(result, 'submitted');
         return result;
     }
 

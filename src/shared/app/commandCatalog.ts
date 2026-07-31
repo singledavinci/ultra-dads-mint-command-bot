@@ -7,6 +7,8 @@ export type CommandDescriptor = { command: string; description: string };
 
 /** Shared on both bots (access, menus, health). */
 export const SHARED_COMMANDS: CommandDescriptor[] = [
+    { command: 'link', description: 'Link your active MintDash subscription' },
+    { command: 'subscription', description: 'Check MintDash subscription access' },
     { command: 'start', description: 'Boot the bot and view the main menu' },
     { command: 'menu', description: 'Open the main menu' },
     { command: 'unlock', description: 'Authenticate using the master passcode' },

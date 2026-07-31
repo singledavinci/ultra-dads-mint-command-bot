@@ -55,6 +55,7 @@ export type DropMintSchedulerDeps = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     notifyAdminUserAction: (actor: any, body: string) => Promise<void>;
     isAdminUserId: (userId: string) => boolean;
+    hasActiveMintDashAccess?: (userId: string) => boolean;
 };
 
 function validateScheduleEthHint(
@@ -152,6 +153,7 @@ async function handleMissedScheduledMint(
         `ID: <code>${sm.id}</code>`;
 
     await deps.safeSendTelegram(sm.addedBy, msg, { parse_mode: 'HTML' }).catch(() => {});
+
     const alertDest = deps.getAlertDest();
     if (alertDest !== sm.addedBy) {
         await deps.safeSendTelegram(alertDest, msg, { parse_mode: 'HTML' }).catch(() => {});
@@ -161,6 +163,22 @@ async function handleMissedScheduledMint(
 export async function fireScheduledMint(sm: ScheduledMint, deps: DropMintSchedulerDeps): Promise<void> {
     deps.schedulerHandles.delete(sm.id);
     console.log(`[Scheduler] Firing scheduled mint: ${sm.id} – ${sm.label}`);
+
+    if (deps.hasActiveMintDashAccess && !deps.hasActiveMintDashAccess(sm.addedBy)) {
+        const state = deps.getState();
+        const entry = state.scheduledMints?.find(s => s.id === sm.id);
+        if (entry) entry.fired = true;
+        await deps.saveState(state).catch(() => {});
+        await deps
+            .safeSendTelegram(
+                sm.addedBy,
+                `🔒 <b>Scheduled mint cancelled</b>\n\n${sm.label}\nYour MintDash subscription is no longer active. Relink or renew before scheduling another mint.`,
+                { parse_mode: 'HTML' }
+            )
+            .catch(() => {});
+        console.warn(`[Scheduler] Access denied for scheduled mint ${sm.id}; no transaction submitted.`);
+        return;
+    }
 
     const alertDest = deps.getAlertDest();
     const setterLabel = deps.userLabelFromStored(sm.addedBy, sm.addedByUsername, sm.addedByFirstName);

@@ -47,6 +47,44 @@ export interface DetectedMint {
     gasLimit?: bigint;
 }
 
+export type TargetedTxpoolEntry = {
+    hash?: string;
+    from?: string;
+    to?: string;
+    input?: string;
+    data?: string;
+    value?: string;
+    gas?: string;
+    gasLimit?: string;
+    maxFeePerGas?: string;
+    maxPriorityFeePerGas?: string;
+};
+
+export type TargetedTxpoolContent = {
+    pending?: Record<string, TargetedTxpoolEntry>;
+    queued?: Record<string, TargetedTxpoolEntry>;
+};
+
+/** Flatten one address-scoped Reth txpool response and reject cross-address entries. */
+export function collectTargetedTxpoolEntries(
+    content: TargetedTxpoolContent | null | undefined,
+    owner: string
+): TargetedTxpoolEntry[] {
+    const normalizedOwner = owner.toLowerCase();
+    const byHash = new Map<string, TargetedTxpoolEntry>();
+    for (const bucket of [content?.pending, content?.queued]) {
+        if (!bucket) continue;
+        for (const entry of Object.values(bucket)) {
+            if (entry.from?.toLowerCase() !== normalizedOwner) continue;
+            const key =
+                entry.hash?.toLowerCase() ||
+                `${normalizedOwner}:${entry.to || ''}:${(entry.input || entry.data || '').slice(0, 42)}`;
+            if (!byHash.has(key)) byHash.set(key, entry);
+        }
+    }
+    return [...byHash.values()];
+}
+
 export type OnMintCallback = (mint: DetectedMint) => void;
 export type OnCandidateCallback = (candidate: MintCandidate) => void;
 
@@ -74,6 +112,7 @@ export function gasFieldsFromTransaction(tx: TransactionResponse): Pick<
 
 export class MintTracker {
     private httpProvider: JsonRpcProvider;
+    private readonly httpUrl: string;
     private wsProvider: WebSocketProvider | null = null;
     private trackedAddresses: Set<string> = new Set();
     private onMintDetected: OnMintCallback;
@@ -136,11 +175,21 @@ export class MintTracker {
     private pendingPaused = false;
     private pendingHandler: ((txHash: string) => void) | null = null;
 
+    // Dedicated-Reth fast path. Instead of fetching arbitrary hashes from the
+    // global pending firehose, ask the local node only for each tracked sender.
+    private targetedTxpoolEnabled: boolean;
+    private targetedTxpoolTimer: ReturnType<typeof setInterval> | null = null;
+    private targetedTxpoolPollInFlight = false;
+    private targetedTxpoolCursor = 0;
+    private targetedTxpoolFailures = 0;
+    private targetedObserved = new Map<string, number>();
+
     constructor(
         httpUrl: string,
         onMint: OnMintCallback,
         opts?: { onCandidate?: OnCandidateCallback; chainId?: number }
     ) {
+        this.httpUrl = httpUrl;
         this.httpProvider = new JsonRpcProvider(httpUrl);
         this.onMintDetected = onMint;
         this.onCandidate = opts?.onCandidate;
@@ -154,6 +203,23 @@ export class MintTracker {
         this.maxPendingRpcPerSec = cfg.trackerMaxPendingRpcPerSec;
         this.bootGraceUntilMs = Date.now() + cfg.trackerBootGraceMs;
         this.maxPendingConcurrent = cfg.trackerMaxPendingConcurrent;
+        const targetedOverride = process.env.TRACKER_TARGETED_TXPOOL?.trim().toLowerCase();
+        const localDefault = (() => {
+            try {
+                const host = new URL(httpUrl).hostname.toLowerCase();
+                return (
+                    host === '10.66.66.1' ||
+                    host === '127.0.0.1' ||
+                    host === 'localhost' ||
+                    host.endsWith('.local')
+                );
+            } catch {
+                return false;
+            }
+        })();
+        this.targetedTxpoolEnabled =
+            targetedOverride === 'true' ||
+            (targetedOverride !== 'false' && localDefault);
     }
 
     addWallet(address: string) {
@@ -193,6 +259,10 @@ export class MintTracker {
         );
 
         await this.syncHeadPointer('startup');
+
+        if (this.enablePending && this.targetedTxpoolEnabled) {
+            this.startTargetedTxpoolPolling();
+        }
 
         // Start WebSocket path if URL is available
         if (this.wsUrl && this.enablePending) {
@@ -252,6 +322,10 @@ export class MintTracker {
             clearInterval(this.wsHeartbeatTimer);
             this.wsHeartbeatTimer = null;
         }
+        if (this.targetedTxpoolTimer) {
+            clearInterval(this.targetedTxpoolTimer);
+            this.targetedTxpoolTimer = null;
+        }
 
         // Stop HTTP
         if (this.blockHandler) {
@@ -286,9 +360,11 @@ export class MintTracker {
     resumePendingDetection(): boolean {
         if (!this.enablePending || !this.pendingPaused) return false;
         this.pendingPaused = false;
-        if (this.wsProvider && this.pendingHandler) {
+        if (!this.targetedTxpoolEnabled && this.wsProvider && this.pendingHandler) {
             this.wsProvider.on('pending', this.pendingHandler);
             log('info', '[Tracker] Mempool pending detection resumed');
+        } else if (this.targetedTxpoolEnabled) {
+            log('info', '[Tracker] Targeted txpool detection resumed');
         }
         return true;
     }
@@ -364,21 +440,28 @@ export class MintTracker {
 
             await this.syncHeadPointer('ws-ready');
 
-            const pendingDelay = parseInt(process.env.TRACKER_PENDING_SUBSCRIBE_DELAY_MS || '3000', 10);
+            const pendingDelay = this.targetedTxpoolEnabled
+                ? 0
+                : parseInt(process.env.TRACKER_PENDING_SUBSCRIBE_DELAY_MS || '3000', 10);
             if (pendingDelay > 0) {
                 log('info', `[Tracker/WS] Pending subscribe in ${pendingDelay}ms (mempool flood guard)`);
                 await new Promise(r => setTimeout(r, pendingDelay));
             }
 
-            log('info', '[Tracker/WS] Connected. Subscribing to pending transactions...');
+            log(
+                'info',
+                this.targetedTxpoolEnabled
+                    ? '[Tracker/WS] Connected. Global pending firehose disabled; targeted Reth txpool is active.'
+                    : '[Tracker/WS] Connected. Subscribing to pending transactions...'
+            );
 
             this.pendingHandler = (txHash: string) => {
                 if (this.pendingPaused) return;
                 this.handlePendingTx(txHash).catch(() => {});
             };
-            if (!this.pendingPaused) {
+            if (!this.targetedTxpoolEnabled && !this.pendingPaused) {
                 this.wsProvider.on('pending', this.pendingHandler);
-            } else {
+            } else if (this.pendingPaused) {
                 log('info', '[Tracker/WS] Pending subscribe skipped — pending detection paused');
             }
 
@@ -457,6 +540,193 @@ export class MintTracker {
     }
 
     // Pending tx rate limiter — prevents RPC exhaustion on free-tier nodes
+    private startTargetedTxpoolPolling(): void {
+        if (this.targetedTxpoolTimer) return;
+        const intervalMs = Math.max(
+            50,
+            parseInt(process.env.TRACKER_TARGETED_TXPOOL_INTERVAL_MS || '100', 10)
+        );
+        const endpoint = (() => {
+            try {
+                return new URL(this.httpUrl).hostname;
+            } catch {
+                return 'configured RPC';
+            }
+        })();
+        log(
+            'info',
+            `[Tracker/Txpool] Targeted Reth polling enabled (${intervalMs}ms, endpoint=${endpoint})`
+        );
+        this.targetedTxpoolTimer = setInterval(() => {
+            void this.pollTargetedTxpool();
+        }, intervalMs);
+        void this.pollTargetedTxpool();
+    }
+
+    private disableTargetedTxpool(reason: string): void {
+        if (!this.targetedTxpoolEnabled) return;
+        this.targetedTxpoolEnabled = false;
+        if (this.targetedTxpoolTimer) {
+            clearInterval(this.targetedTxpoolTimer);
+            this.targetedTxpoolTimer = null;
+        }
+        log(
+            'warn',
+            `[Tracker/Txpool] Targeted polling disabled (${reason}); falling back to global pending subscription.`
+        );
+        if (this.wsProvider && this.pendingHandler && !this.pendingPaused) {
+            this.wsProvider.off('pending', this.pendingHandler);
+            this.wsProvider.on('pending', this.pendingHandler);
+        }
+    }
+
+    private async pollTargetedTxpool(): Promise<void> {
+        if (
+            !this.isRunning ||
+            this.pendingPaused ||
+            this.targetedTxpoolPollInFlight ||
+            this.trackedAddresses.size === 0
+        ) {
+            return;
+        }
+
+        this.targetedTxpoolPollInFlight = true;
+        try {
+            const addresses = [...this.trackedAddresses];
+            const batchSize = Math.max(
+                1,
+                parseInt(process.env.TRACKER_TARGETED_TXPOOL_BATCH_SIZE || '32', 10)
+            );
+            const concurrency = Math.max(
+                1,
+                parseInt(process.env.TRACKER_TARGETED_TXPOOL_CONCURRENCY || '8', 10)
+            );
+            const take = Math.min(batchSize, addresses.length);
+            const batch = Array.from(
+                { length: take },
+                (_, i) => addresses[(this.targetedTxpoolCursor + i) % addresses.length]
+            );
+            this.targetedTxpoolCursor = (this.targetedTxpoolCursor + take) % addresses.length;
+
+            let cursor = 0;
+            let successfulRpcCalls = 0;
+            const entries: TargetedTxpoolEntry[] = [];
+            const worker = async () => {
+                while (cursor < batch.length) {
+                    const address = batch[cursor++];
+                    try {
+                        const content = (await this.httpProvider.send('txpool_contentFrom', [
+                            address,
+                        ])) as TargetedTxpoolContent | null;
+                        successfulRpcCalls++;
+                        entries.push(...collectTargetedTxpoolEntries(content, address));
+                    } catch (err) {
+                        trackerDebugState.incrementRpcErrors();
+                        logRateLimited(
+                            'tracker-targeted-txpool-rpc',
+                            30_000,
+                            'warn',
+                            '[Tracker/Txpool] txpool_contentFrom failed:',
+                            (err as Error).message
+                        );
+                    }
+                }
+            };
+            await Promise.all(
+                Array.from({ length: Math.min(concurrency, batch.length) }, () => worker())
+            );
+
+            if (successfulRpcCalls === 0 && batch.length > 0) {
+                this.targetedTxpoolFailures++;
+                if (this.targetedTxpoolFailures >= 3) {
+                    this.disableTargetedTxpool('RPC method unavailable');
+                }
+                return;
+            }
+            this.targetedTxpoolFailures = 0;
+
+            for (const entry of entries) {
+                this.handleTargetedTxpoolEntry(entry);
+            }
+        } finally {
+            this.targetedTxpoolPollInFlight = false;
+        }
+    }
+
+    private handleTargetedTxpoolEntry(entry: TargetedTxpoolEntry): void {
+        const hash = entry.hash?.toLowerCase();
+        const from = entry.from?.toLowerCase();
+        const to = entry.to;
+        const data = entry.input || entry.data;
+        if (!hash || !/^0x[0-9a-f]{64}$/.test(hash) || !from || !to || !data) return;
+        if (!this.trackedAddresses.has(from)) return;
+
+        const now = Date.now();
+        const observedAt = this.targetedObserved.get(hash);
+        if (observedAt && now - observedAt < 120_000) return;
+        this.targetedObserved.set(hash, now);
+        if (this.targetedObserved.size > 10_000) {
+            for (const [key, at] of this.targetedObserved) {
+                if (now - at >= 120_000) this.targetedObserved.delete(key);
+            }
+        }
+
+        this.stats.pendingTxsSeen++;
+        let value: bigint;
+        try {
+            value = BigInt(entry.value || '0');
+        } catch {
+            return;
+        }
+
+        const classification = this.usePermissiveClassifier
+            ? classifyTrackedWalletTx(data, value.toString(), to)
+            : classifyMintTransaction(data, value.toString(), to, this.copyUnknownCalls);
+        if (!classification.isMint) {
+            this.stats.nonMintsRejected++;
+            trackerDebugState.setLastSkipReason('classifierRejected');
+            return;
+        }
+        if (!markTxSeenIfNew(hash, 'pending')) {
+            this.stats.duplicatesSkipped++;
+            trackerDebugState.incrementDuplicates();
+            trackerDebugState.setLastSkipReason('duplicateTx');
+            return;
+        }
+
+        const asBigInt = (raw?: string): bigint | undefined => {
+            if (!raw) return undefined;
+            try {
+                return BigInt(raw);
+            } catch {
+                return undefined;
+            }
+        };
+
+        this.stats.mintsDetected++;
+        this.stats.lastPendingTime = now;
+        log(
+            'info',
+            `[Tracker/Txpool] WHALE MINT ${hash.slice(0, 12)}... | ${from.slice(0, 10)} -> ${to.slice(0, 10)} | ${classification.confidence}`
+        );
+        this.emitMint(
+            {
+                hash,
+                from,
+                to,
+                value: value.toString(),
+                data,
+                timestamp: now,
+                classificationConfidence: classification.confidence,
+                detectionPath: 'pending',
+                maxFeePerGas: asBigInt(entry.maxFeePerGas),
+                maxPriorityFeePerGas: asBigInt(entry.maxPriorityFeePerGas),
+                gasLimit: asBigInt(entry.gasLimit || entry.gas),
+            },
+            'targeted-txpool'
+        );
+    }
+
     private pendingInFlight: number = 0;
     private readonly maxPendingConcurrent: number;
     private pendingSkipped: number = 0;

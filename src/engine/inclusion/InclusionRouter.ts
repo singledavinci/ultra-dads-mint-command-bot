@@ -6,12 +6,18 @@ import { defaultBundleReceiptBuilder, runBundleSubmitLoop } from './bundleSubmit
 import type { WalletExecutionPlan, WalletReceipt } from '../../types/copyMint';
 import type { InclusionBroadcastOptions, InclusionMode } from '../../types/inclusion';
 import { inclusionMetrics } from './inclusionMetrics';
-import { capBuilderTipWei, isBuilderMode, resolveInclusionMode } from '../../utils/inclusionMode';
+import {
+    capBuilderTipWei,
+    isBuilderMode,
+    resolveInclusionMode,
+    supportsRpcBlast,
+} from '../../utils/inclusionMode';
 import { resetNonce } from '../NonceManager';
 import { FlashbotsBuilder } from './builders/FlashbotsBuilder';
 import { TitanBuilder } from './builders/TitanBuilder';
 import type { BuilderAdapter } from './builders/BuilderAdapter';
 import { MevBlockerAdapter } from './MevBlockerAdapter';
+import { FlashbotsProtectAdapter } from './FlashbotsProtectAdapter';
 import { PublicBroadcastAdapter } from './PublicBroadcastAdapter';
 
 export class InclusionRouter {
@@ -26,6 +32,17 @@ export class InclusionRouter {
     ): Promise<WalletReceipt> {
         const mode = resolveInclusionMode(opts);
 
+        if (!plan.canBroadcast) {
+            return skipReceipt(plan, plan.skipReason);
+        }
+
+        if (mode === 'delegation') {
+            return skipReceipt(
+                plan,
+                'Delegation batch is not available on the Telegram bot yet — use MintDash DELEGATION_CONTRACT or Direct RPC blast.'
+            );
+        }
+
         if (isBuilderMode(mode)) {
             const cfg = getRuntimeConfig();
             if (!cfg.builderMintEnabled) {
@@ -39,8 +56,25 @@ export class InclusionRouter {
             return MevBlockerAdapter.broadcast(provider, plan);
         }
 
+        if (mode === 'private_rpc') {
+            inclusionMetrics.privateRpcBroadcasts++;
+            return FlashbotsProtectAdapter.broadcast(provider, plan);
+        }
+
+        if (mode === 'private_rpc_direct') {
+            inclusionMetrics.directRpcBlasts++;
+            return PublicBroadcastAdapter.broadcast(provider, plan, {
+                blast: true,
+                blastRpcUrls: opts?.blastRpcUrls,
+            });
+        }
+
         inclusionMetrics.publicBroadcasts++;
-        return PublicBroadcastAdapter.broadcast(provider, plan);
+        const cfg = getRuntimeConfig();
+        return PublicBroadcastAdapter.broadcast(provider, plan, {
+            blast: supportsRpcBlast(mode) && cfg.broadcastToMultipleRpcs,
+            blastRpcUrls: opts?.blastRpcUrls,
+        });
     }
 
     static async broadcastBundle(
@@ -51,7 +85,14 @@ export class InclusionRouter {
         const mode = resolveInclusionMode(opts);
         const broadcastable = plans.filter(p => p.canBroadcast);
 
+        // Non-builder OR nothing to send: fan out per plan WITHOUT re-entering builder
+        // recursion (broadcastPlan → broadcastBuilderSingle → broadcastBundle).
         if (!isBuilderMode(mode) || broadcastable.length === 0) {
+            if (isBuilderMode(mode) && broadcastable.length === 0) {
+                return plans.map(p =>
+                    skipReceipt(p, p.skipReason || 'No broadcastable wallets for builder bundle')
+                );
+            }
             const receipts: WalletReceipt[] = [];
             for (const plan of plans) {
                 receipts.push(await InclusionRouter.broadcastPlan(provider, plan, opts));
@@ -115,11 +156,28 @@ export class InclusionRouter {
         inclusionMetrics.lastError = lastError;
         InclusionRouter.resetNoncesForPlans(broadcastable);
 
-        if (cfg.builderAllowPublicFallback) {
-            inclusionMetrics.lastError = `${lastError} — public fallback enabled (risky)`;
+        // Auth/signature failures are configuration bugs — never burn the fire on a dead relay.
+        // Fall back to Direct RPC blast so FCFS / link mints still land.
+        const relayFail =
+            /invalid flashbots signature|unauthorized|flashbots.?auth|invalid signature|block not found/i.test(
+                lastError
+            );
+        if (relayFail || cfg.builderAllowPublicFallback) {
+            const via = relayFail ? 'private_rpc_direct' : 'public';
+            inclusionMetrics.lastError = `${lastError} — falling back to ${via}`;
+            inclusionMetrics.directRpcBlasts += relayFail ? broadcastable.length : 0;
             const receipts: WalletReceipt[] = [];
             for (const plan of plans) {
-                receipts.push(await PublicBroadcastAdapter.broadcast(provider, plan));
+                if (!plan.canBroadcast) {
+                    receipts.push(skipReceipt(plan, plan.skipReason));
+                    continue;
+                }
+                receipts.push(
+                    await PublicBroadcastAdapter.broadcast(provider, plan, {
+                        blast: relayFail,
+                        blastRpcUrls: opts?.blastRpcUrls,
+                    })
+                );
             }
             return receipts;
         }

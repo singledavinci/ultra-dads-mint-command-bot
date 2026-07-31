@@ -77,7 +77,7 @@ const mintNames = new Set(mintCommands.map(c => c.command));
 for (const name of copyNames) {
     if (mintNames.has(name)) {
         assert.ok(
-            ['start', 'menu', 'unlock', 'help', 'guide', 'ping', 'checkdb', 'db', 'wallets', 'wallet', 'status', 'version', 'rpc', 'myrpc', 'setrpc'].includes(name),
+            ['start', 'menu', 'unlock', 'link', 'subscription', 'help', 'guide', 'ping', 'checkdb', 'db', 'wallets', 'wallet', 'status', 'version', 'rpc', 'myrpc', 'setrpc'].includes(name),
             `unexpected shared command collision: ${name}`
         );
     }

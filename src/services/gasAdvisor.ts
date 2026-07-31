@@ -6,12 +6,14 @@ import { formatEther, JsonRpcProvider, parseUnits } from 'ethers';
 import { getRuntimeConfig } from '../config/runtimeConfig';
 import { intrinsicGasFloor } from '../engine/GasPlanner';
 import {
-    computeGasFeesForTier,
+    computeGasFeesForTierAsync,
     GAS_TIER_DEFS,
     resolveLiveNetworkFees,
 } from './networkGas';
+import { paddedGasLimit } from './executionGas';
 import { priorityBoostWeiFromEth } from './builderPayment';
 import { uiRow, uiScreen } from '../bot/ui/premiumMessages';
+import type { InclusionMode } from '../types/inclusion';
 
 export type { GasTierId } from './networkGas';
 
@@ -37,8 +39,8 @@ export interface GasTierOption {
     costUsdPerWallet: number;
     totalEth: number;
     totalUsd: number;
-    /** Suggested inclusion mode when BUILDER_MINT_ENABLED */
-    suggestedInclusionMode: 'public' | 'builder_flashbots';
+    /** Suggested inclusion mode when BUILDER_MINT_ENABLED / FCFS */
+    suggestedInclusionMode: InclusionMode;
 }
 
 export interface GasAdvisorReport {
@@ -123,36 +125,53 @@ export async function buildGasAdvisorReport(params: {
 
     const { price: ethUsd, source: ethUsdSource } = ethUsdPack;
 
-    let gasLimit = BigInt(cfg.fastGasLimit);
+    let rawEstimate = BigInt(cfg.fastGasLimit);
     if (estimateResult.ok) {
-        gasLimit = (estimateResult.gas * BigInt(Math.round(cfg.gasLimitMultiplier * 100))) / 100n;
+        rawEstimate = estimateResult.gas;
     } else if (params.estimateGas) {
-        warnings.push(`Gas estimate failed — using ${cfg.fastGasLimit} limit (+${cfg.gasLimitMultiplier}× buffer when est works)`);
+        warnings.push(`Gas estimate failed — using ${cfg.fastGasLimit} (tier pad applied)`);
     } else {
         warnings.push('No calldata to estimate — costs use FAST_GAS_LIMIT (may be low for SeaDrop max mint)');
     }
 
     const floor = intrinsicGasFloor(calldataForFloor);
-    if (gasLimit < floor) {
-        gasLimit = floor;
-        warnings.push(`Raised gas limit to intrinsic floor (${floor}) for this calldata size`);
+    if (rawEstimate < floor) {
+        rawEstimate = floor;
+        warnings.push(`Raised gas estimate to intrinsic floor (${floor}) for this calldata size`);
     }
+
+    // Preview uses network pad (3%); competitive tiers pad similarly in execution.
+    const gasLimit = paddedGasLimit(rawEstimate, 'normal');
+    warnings.push('Fees: network = feeHistory (no ×1.15); FCFS = tip floors + Direct');
 
     const tiers: GasTierOption[] = [];
     const builderEnabled = cfg.builderMintEnabled;
 
-    for (const def of GAS_TIER_DEFS) {
-        const fees = computeGasFeesForTier(live, def.id)!;
+    const tierFees = await Promise.all(
+        GAS_TIER_DEFS.map(async def => ({ def, fees: await computeGasFeesForTierAsync(params.provider, def.id) }))
+    );
+
+    for (const { def, fees } of tierFees) {
+        if (!fees) continue;
+        const tierGasLimit = paddedGasLimit(rawEstimate, def.id);
         const boostEth = Math.min(def.builderTipEth, cfg.maxBuilderTipEth);
         const boostWei = priorityBoostWeiFromEth(boostEth);
         const boostEthNum = Number(boostWei) / 1e18;
-        const boostedPriority = fees.maxPriorityFeePerGas + (gasLimit > 0n ? boostWei / gasLimit : 0n);
+        const boostedPriority = fees.maxPriorityFeePerGas + (tierGasLimit > 0n ? boostWei / tierGasLimit : 0n);
         const boostedMax = boostedPriority > fees.maxFeePerGas ? boostedPriority : fees.maxFeePerGas;
-        const costEth = tierCostEth(gasLimit, boostedMax, mintValueWei);
+        const costEth = tierCostEth(tierGasLimit, boostedMax, mintValueWei);
         const costUsd = costEth * ethUsd;
         const totalEth = costEth * params.walletCount;
         const totalUsd = costUsd * params.walletCount;
         const useBuilder = builderEnabled && boostEth > 0;
+        // MintDash-aligned: FCFS tiers prefer Direct RPC blast; normal stays public;
+        // tip+builder → Flashbots bundle. Delegation is never auto-suggested on Telegram.
+        let suggestedInclusionMode: InclusionMode = 'public';
+        if (useBuilder) {
+            suggestedInclusionMode = 'builder_flashbots';
+        } else if (def.id === 'fcfs' || def.id === 'fcfs_plus' || def.id === 'fcfs_max' || def.id === 'overdrive') {
+            suggestedInclusionMode = 'private_rpc_direct';
+        }
 
         tiers.push({
             id: def.id,
@@ -168,12 +187,12 @@ export async function buildGasAdvisorReport(params: {
             priorityGwei: fees.priorityGwei,
             maxFeePerGasWei: fees.maxFeePerGas.toString(),
             maxPriorityFeePerGasWei: fees.maxPriorityFeePerGas.toString(),
-            gasLimit: gasLimit.toString(),
+            gasLimit: tierGasLimit.toString(),
             costEthPerWallet: costEth,
             costUsdPerWallet: costUsd,
             totalEth,
             totalUsd,
-            suggestedInclusionMode: useBuilder ? 'builder_flashbots' : 'public',
+            suggestedInclusionMode,
         });
     }
 
@@ -199,7 +218,7 @@ export function formatGasAdvisorMessage(report: GasAdvisorReport, targetLine: st
         '\n' +
         uiRow(
             'Network',
-            `~<b>${report.baseBlockMaxFeeGwei.toFixed(2)}</b> gwei max · <b>${report.baseBlockPriorityGwei.toFixed(2)}</b> priority`
+            `~<b>${report.baseBlockMaxFeeGwei.toFixed(3)}</b> gwei base · <b>${report.baseBlockPriorityGwei.toFixed(3)}</b> tip`
         ) +
         '\n' +
         uiRow('ETH price', `<b>$${report.ethUsd.toFixed(0)}</b> <i>(${report.ethUsdSource})</i>`) +
@@ -212,8 +231,18 @@ export function formatGasAdvisorMessage(report: GasAdvisorReport, targetLine: st
             t.priorityBoostEth > 0
                 ? ` · boost <b>${t.priorityBoostEth.toFixed(4)}</b> ETH (<b>$${(t.priorityBoostEth * report.ethUsd).toFixed(2)}</b>)`
                 : '';
+        const route =
+            t.suggestedInclusionMode === 'builder_flashbots'
+                ? 'Builder'
+                : t.suggestedInclusionMode === 'private_rpc_direct'
+                  ? 'Direct RPC'
+                  : t.suggestedInclusionMode === 'private_rpc'
+                    ? 'Protect'
+                    : t.suggestedInclusionMode === 'delegation'
+                      ? 'Delegation (MintDash)'
+                      : 'Public';
         body +=
-            `\n\n<b>${t.label}</b>\n` +
+            `\n\n<b>${t.label}</b> · <i>${route}</i>\n` +
             `<i>${t.hint}</i>\n` +
             `Priority <b>${t.priorityGwei.toFixed(2)}</b> gwei · max <b>${t.maxFeeGwei.toFixed(2)}</b> gwei${boostLine}\n` +
             `Per wallet ~<b>${t.costEthPerWallet.toFixed(5)}</b> ETH (<b>$${t.costUsdPerWallet.toFixed(2)}</b>)\n` +

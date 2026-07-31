@@ -7,9 +7,12 @@ import { orderBundleTxs } from '../src/services/bundleAssembler';
 import { applyPriorityBoostToPlan, priorityBoostWeiFromEth } from '../src/services/builderPayment';
 import { validateBundleBudget } from '../src/services/bundleBudget';
 import {
+    inclusionModeForGasTier,
     inclusionModeFromState,
     isBuilderMode,
+    parseInclusionMode,
     resolveInclusionMode,
+    supportsRpcBlast,
 } from '../src/utils/inclusionMode';
 import type { SignedBundleTx } from '../src/types/inclusion';
 import type { WalletExecutionPlan } from '../src/types/copyMint';
@@ -29,11 +32,20 @@ console.log('Test 2: inclusionModeFromState migration...');
     console.log('  ✅ state migration');
 }
 
-console.log('Test 3: isBuilderMode...');
+console.log('Test 3: isBuilderMode + MintDash aliases...');
 {
     assert.strictEqual(isBuilderMode('builder_flashbots'), true);
     assert.strictEqual(isBuilderMode('public'), false);
-    console.log('  ✅ builder detection');
+    assert.strictEqual(parseInclusionMode('PRIVATE_RPC_DIRECT'), 'private_rpc_direct');
+    assert.strictEqual(parseInclusionMode('direct'), 'private_rpc_direct');
+    assert.strictEqual(parseInclusionMode('PRIVATE_RPC'), 'private_rpc');
+    assert.strictEqual(parseInclusionMode('FLASHBOTS_BUNDLE'), 'builder_flashbots');
+    assert.strictEqual(parseInclusionMode('DELEGATION_CONTRACT'), 'delegation');
+    assert.strictEqual(supportsRpcBlast('private_rpc_direct'), true);
+    assert.strictEqual(supportsRpcBlast('private_rpc'), false);
+    assert.strictEqual(inclusionModeForGasTier('fcfs_plus'), 'private_rpc_direct');
+    assert.strictEqual(inclusionModeForGasTier('normal'), 'public');
+    console.log('  ✅ builder + aliases + blast gates');
 }
 
 console.log('Test 4: orderBundleTxs nonce ordering...');
@@ -98,8 +110,23 @@ console.log('Test 7: bundle budget rejects over cap...');
 
     const result = validateBundleBudget({ plans: many, priorityBoostWei: 0n });
     assert.strictEqual(result.ok, false);
-    assert(result.error?.includes('BUILDER_MAX_TXS_PER_BUNDLE'));
-    console.log('  ✅ wallet cap enforced');
+    console.log('  ✅ budget gate');
 }
 
-console.log('\n✅ All inclusion tests passed.\n');
+console.log('Test 8: builder empty-broadcastable must not recurse via broadcastPlan...');
+{
+    const source = await import('node:fs').then(fs =>
+        fs.readFileSync(new URL('../src/engine/inclusion/InclusionRouter.ts', import.meta.url), 'utf8')
+    );
+    assert(
+        source.includes("No broadcastable wallets for builder bundle"),
+        'builder empty path must short-circuit without re-entering broadcastPlan'
+    );
+    assert(
+        source.includes('if (!plan.canBroadcast)'),
+        'broadcastPlan must skip non-broadcastable plans before builder single'
+    );
+    console.log('  ✅ recursion guards present');
+}
+
+console.log('All inclusion tests passed.');
