@@ -99,6 +99,7 @@ export class WalletPreflight {
                 overdrive: params.options?.overdrive,
                 gasBribeGwei: params.options?.gasBribeGwei,
                 gasTierId: params.options?.gasTierId,
+                inclusionMode: params.options?.inclusionMode,
                 gasLimitOverride: params.options?.gasLimitOverride,
             });
         }
@@ -384,6 +385,7 @@ export class WalletPreflight {
             overdrive: ctx.options?.overdrive,
             gasBribeGwei: ctx.options?.gasBribeGwei,
             gasTierId: ctx.options?.gasTierId,
+            inclusionMode: ctx.options?.inclusionMode,
             gasLimitOverride: ctx.options?.gasLimitOverride,
             forceGasEstimate:
                 ctx.options?.forceGasEstimate || Boolean(ctx.seaDropNft) || Boolean(ctx.scatterSlug),

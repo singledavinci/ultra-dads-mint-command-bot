@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import { GasPlanner, intrinsicGasFloor } from '../src/engine/GasPlanner';
 
-function testBroadcastGasLimitHeadroom() {
-    const est = 80_000n;
-    const limit = GasPlanner.applyBroadcastGasLimit(est, {
-        gasLimitMultiplier: 1.25,
-        fastGasLimit: 150_000,
-    } as any);
-    assert.ok(limit >= est + 30_000n, `expected headroom above estimate, got ${limit}`);
-    assert.ok(limit <= 150_000n);
+function testBroadcastGasLimitNetworkPad() {
+    const est = 100_000n;
+    const limit = GasPlanner.applyBroadcastGasLimit(est, { fastGasLimit: 500_000 } as any, 'normal');
+    assert.equal(limit, 103_000n, `network 3% pad, got ${limit}`);
+}
+
+function testBroadcastGasLimitCompetitivePad() {
+    const est = 100_000n;
+    const limit = GasPlanner.applyBroadcastGasLimit(est, { fastGasLimit: 500_000 } as any, 'fcfs_plus');
+    assert.equal(limit, 110_000n, `competitive 10% pad, got ${limit}`);
 }
 
 function testSeaDropIntrinsicMatchesFailedTxCap() {
@@ -23,13 +25,11 @@ function testSeaDropIntrinsicMatchesFailedTxCap() {
         fastCap >= 82_000n && fastCap <= 83_000n,
         `fast-path cap should be ~82k (failed tx used 82264), got ${fastCap}`
     );
-    const broadcast = GasPlanner.applyBroadcastGasLimit(fastCap, {
-        gasLimitMultiplier: 1.25,
-        fastGasLimit: 150_000,
-    } as any);
+    const broadcast = GasPlanner.applyBroadcastGasLimit(fastCap, { fastGasLimit: 150_000 } as any, 'fcfs_plus');
     assert.ok(broadcast > 82_264n, 'broadcast limit must exceed bare intrinsic fast cap');
 }
 
-testBroadcastGasLimitHeadroom();
+testBroadcastGasLimitNetworkPad();
+testBroadcastGasLimitCompetitivePad();
 testSeaDropIntrinsicMatchesFailedTxCap();
 console.log('gasPlanner.test.ts: ok');
